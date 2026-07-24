@@ -20,6 +20,9 @@ app = FastAPI()
 # room -> { user -> websocket }
 rooms: Dict[str, Dict[str, WebSocket]] = {}
 
+# `to` 宛に中継してよいメッセージ種別（契約①）。これ以外は捨てる。
+RELAYABLE_TYPES = {"offer", "answer", "ice"}
+
 # --- TURN（NAT越え）設定。環境変数で注入。未設定ならSTUNのみで動く ---
 STUN_URL = os.environ.get("STUN_URL", "stun:stun.l.google.com:19302")
 TURN_HOST = os.environ.get("TURN_HOST", "")          # 例: turn.example.com（coturnの公開ホスト）
@@ -46,6 +49,9 @@ def health():
 
     メディアはP2Pで流れるためサーバー負荷にはならないが、
     「シグナリングが生きているか」「今何人繋がっているか」はここで分かる。
+
+    ★認証なしで公開される口なので、返すのは**数だけ**に限る。
+      部屋名・参加者名を出すと「今この会議に誰がいるか」が公開URLから丸見えになる。
     """
     return {
         "status": "ok",
@@ -102,10 +108,24 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     try:
         while True:
             raw = await websocket.receive_text()
-            msg = json.loads(raw)
+
+            # 壊れたJSONで接続を落とさない（1通捨てて継続）。
+            # json.loads の例外は WebSocketDisconnect では捕まらないため個別に握る。
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(msg, dict):
+                continue
+
+            # 中継するのは契約①のシグナリング用途に限定する。
+            # 任意のtypeを通すと、このサーバーが第三者への汎用メッセージ中継として悪用され得る。
+            if msg.get("type") not in RELAYABLE_TYPES:
+                continue
+
             msg["from"] = user
             to = msg.get("to")
-            if to and to in peers:
+            if isinstance(to, str) and to in peers:
                 await peers[to].send_json(msg)
     except WebSocketDisconnect:
         pass
@@ -118,6 +138,15 @@ async def ws_endpoint(websocket: WebSocket) -> None:
             rooms.pop(room, None)
 
 
+class NoCacheStaticFiles(StaticFiles):
+    """開発中に古いJS/HTMLがブラウザキャッシュから出るのを防ぐ。"""
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 # web/ を静的配信（http://localhost:8000/test.html など）
 web_dir = Path(__file__).resolve().parent.parent / "web"
-app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")
+app.mount("/", NoCacheStaticFiles(directory=str(web_dir), html=True), name="web")

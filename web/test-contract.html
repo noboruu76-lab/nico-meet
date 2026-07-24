@@ -10,6 +10,9 @@
     #summary.pass { background: #143; color: #7f7; }
     #summary.fail { background: #411; color: #f88; }
     #summary.wait { background: #331; color: #fd7; }
+    #mediaMode { font-size: 13px; margin: 8px 0; padding: 8px 10px; border-radius: 6px; }
+    #mediaMode.fake { background: #3a2f10; color: #fd7; border: 1px solid #765; }
+    #mediaMode.real { background: #123; color: #7cf; border: 1px solid #467; }
     table { border-collapse: collapse; width: 100%; max-width: 900px; font-size: 13px; }
     td, th { border: 1px solid #333; padding: 5px 8px; text-align: left; }
     th { background: #222; }
@@ -21,6 +24,7 @@
 </head>
 <body>
   <h1>NICO Meet — 契約②適合検査（担当A：引き渡し前の自己検証）</h1>
+  <div id="mediaMode">メディアモード判定中…</div>
   <div id="summary" class="wait">検査中…</div>
   <table>
     <thead><tr><th>#</th><th>検査項目（契約②の条文）</th><th>結果</th><th>詳細</th></tr></thead>
@@ -79,7 +83,16 @@
     }
 
     // 検証環境用の疑似カメラ/マイク（実機では不要）
-    if (params.get('fakemedia') !== '0') {
+    // 既定はON。実デバイスで走らせるには ?fakemedia=0 を付ける。
+    const useFake = params.get('fakemedia') !== '0';
+    const modeEl = document.getElementById('mediaMode');
+    modeEl.className = useFake ? 'fake' : 'real';
+    modeEl.innerHTML = useFake
+      ? '⚠️ <b>疑似メディアモード</b>（既定）— カメラ/マイクを使わないダミー映像音声で検査中。'
+        + '実デバイスで検査するには <code>?fakemedia=0</code> を付けてください。'
+      : '📷 <b>実デバイスモード</b>（<code>fakemedia=0</code>）— 実際のカメラ/マイクで検査中。';
+
+    if (useFake) {
       navigator.mediaDevices.getUserMedia = async () => {
         const canvas = document.createElement('canvas');
         canvas.width = 320; canvas.height = 240;
