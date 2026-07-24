@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>NICO Meet — 契約②適合検査</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+    h1 { font-size: 16px; }
+    #summary { font-size: 15px; font-weight: bold; margin: 12px 0; padding: 10px; border-radius: 6px; background: #222; }
+    #summary.pass { background: #143; color: #7f7; }
+    #summary.fail { background: #411; color: #f88; }
+    #summary.wait { background: #331; color: #fd7; }
+    table { border-collapse: collapse; width: 100%; max-width: 900px; font-size: 13px; }
+    td, th { border: 1px solid #333; padding: 5px 8px; text-align: left; }
+    th { background: #222; }
+    .ok { color: #7f7; }
+    .ng { color: #f88; }
+    .pend { color: #999; }
+    .note { color: #999; font-size: 12px; margin-top: 14px; max-width: 900px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>NICO Meet — 契約②適合検査（担当A：引き渡し前の自己検証）</h1>
+  <div id="summary" class="wait">検査中…</div>
+  <table>
+    <thead><tr><th>#</th><th>検査項目（契約②の条文）</th><th>結果</th><th>詳細</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="note">
+    このページは <code>connection.js</code> を<strong>契約②で公開されたAPIだけ</strong>で駆動する。
+    内部プロパティ（<code>_audioSources</code> 等）には一切触れない＝担当BのUIと同じ条件。
+    ここが全てPASSなら、契約②どおりに書かれたUIは差し替えるだけで動く。<br>
+    <strong>使い方</strong>: このページを<strong>2タブ</strong>で開く（<code>?user=</code> を変える）。
+    1タブ目だけでは相手が居ないため peer 系はPENDINGのまま。
+  </p>
+
+  <script type="module">
+    import { ConnectionManager } from './connection.js';
+    import { getIceServers } from './config.js';
+
+    const params = new URLSearchParams(location.search);
+    const room = params.get('room') || 'contract';
+    const user = params.get('user') || ('u' + Math.floor(Math.random() * 10000));
+
+    const results = [];
+    const rowsEl = document.getElementById('rows');
+
+    const record = (name, status, detail = '') => {
+      const existing = results.find((r) => r.name === name);
+      if (existing) { existing.status = status; existing.detail = detail; }
+      else results.push({ name, status, detail });
+      render();
+    };
+    const pass = (n, d) => record(n, 'PASS', d);
+    const fail = (n, d) => record(n, 'FAIL', d);
+    const pend = (n, d) => record(n, 'PENDING', d);
+
+    function render() {
+      rowsEl.innerHTML = '';
+      results.forEach((r, i) => {
+        const cls = r.status === 'PASS' ? 'ok' : r.status === 'FAIL' ? 'ng' : 'pend';
+        rowsEl.insertAdjacentHTML('beforeend',
+          `<tr><td>${i + 1}</td><td>${r.name}</td><td class="${cls}">${r.status}</td><td>${r.detail}</td></tr>`);
+      });
+      const failed = results.filter((r) => r.status === 'FAIL').length;
+      const pending = results.filter((r) => r.status === 'PENDING').length;
+      const passed = results.filter((r) => r.status === 'PASS').length;
+      const s = document.getElementById('summary');
+      if (failed > 0) {
+        s.className = 'fail';
+        s.textContent = `FAIL ${failed}件 / PASS ${passed}件 — 契約違反あり。結合前に修正が必要`;
+      } else if (pending > 0) {
+        s.className = 'wait';
+        s.textContent = `PASS ${passed}件 / 相手待ち ${pending}件 — 2タブ目を開くと peer 系が走ります`;
+      } else {
+        s.className = 'pass';
+        s.textContent = `全 ${passed} 項目 PASS — 契約②に完全適合。担当BのUIは差し替えるだけで繋がります`;
+      }
+    }
+
+    // 検証環境用の疑似カメラ/マイク（実機では不要）
+    if (params.get('fakemedia') !== '0') {
+      navigator.mediaDevices.getUserMedia = async () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 320; canvas.height = 240;
+        const ctx = canvas.getContext('2d');
+        const hue = Math.floor(Math.random() * 360);
+        setInterval(() => {
+          ctx.fillStyle = `hsl(${hue},70%,${30 + 20 * Math.sin(Date.now() / 300)}%)`;
+          ctx.fillRect(0, 0, 320, 240);
+        }, 100);
+        const audioCtx = new AudioContext();
+        const osc = audioCtx.createOscillator();
+        osc.frequency.value = 220 + hue;
+        const dest = audioCtx.createMediaStreamDestination();
+        osc.connect(dest); osc.start();
+        return new MediaStream([canvas.captureStream(15).getVideoTracks()[0], dest.stream.getAudioTracks()[0]]);
+      };
+    }
+
+    // ---- 検査開始 ----
+    const iceServers = await getIceServers(location.origin);
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+
+    // 1. コンストラクタ（契約②の引数4つ）
+    let cm;
+    try {
+      cm = new ConnectionManager({
+        room, user,
+        signalingUrl: `${wsProto}://${location.host}/ws`,
+        iceServers,
+      });
+      pass('new ConnectionManager({room,user,signalingUrl,iceServers})', 'インスタンス生成成功');
+    } catch (e) {
+      fail('new ConnectionManager({room,user,signalingUrl,iceServers})', String(e));
+      throw e;
+    }
+
+    // 2. メソッドが契約どおり存在するか（名前・引数の数）
+    const methodSpec = [
+      ['on', 2], ['join', 0], ['leave', 0],
+      ['toggleMic', 1], ['toggleCam', 1], ['getMixedAudioTrack', 0],
+    ];
+    for (const [name, arity] of methodSpec) {
+      const fn = cm[name];
+      if (typeof fn !== 'function') fail(`メソッド ${name}()`, '存在しない');
+      else if (fn.length !== arity) fail(`メソッド ${name}()`, `引数の数が違う: 期待${arity} / 実際${fn.length}`);
+      else pass(`メソッド ${name}()`, `引数${arity}個`);
+    }
+
+    // 3. イベント購読（契約②の4イベント）
+    const seen = {};
+    let localStream = null;
+    pend("イベント 'local-stream' (stream)", '待機中');
+    pend("イベント 'mode-changed' ({mode})", '待機中');
+    pend("イベント 'peer-joined' ({peerId, stream})", '2タブ目を開くと実行');
+    pend("イベント 'peer-left' ({peerId})", '相手が退出すると実行');
+
+    cm.on('local-stream', (stream) => {
+      seen.local = true;
+      localStream = stream;
+      if (stream instanceof MediaStream && stream.getTracks().length > 0) {
+        pass("イベント 'local-stream' (stream)",
+          `MediaStream / 音声${stream.getAudioTracks().length} 映像${stream.getVideoTracks().length}`);
+      } else {
+        fail("イベント 'local-stream' (stream)", 'MediaStreamでない、またはトラック0');
+      }
+    });
+
+    cm.on('mode-changed', ({ mode }) => {
+      if (mode === 'mesh') pass("イベント 'mode-changed' ({mode})", `mode='${mode}'`);
+      else fail("イベント 'mode-changed' ({mode})", `期待'mesh' / 実際'${mode}'`);
+    });
+
+    cm.on('peer-joined', ({ peerId, stream }) => {
+      if (typeof peerId === 'string' && stream instanceof MediaStream) {
+        pass("イベント 'peer-joined' ({peerId, stream})",
+          `peerId='${peerId}' / 音声${stream.getAudioTracks().length} 映像${stream.getVideoTracks().length}`);
+        // 相手が居る状態でmixを再検査（全員の声が入るか）
+        checkMix('相手接続後');
+      } else {
+        fail("イベント 'peer-joined' ({peerId, stream})", `型が違う peerId=${typeof peerId} stream=${stream?.constructor?.name}`);
+      }
+    });
+
+    cm.on('peer-left', ({ peerId }) => {
+      if (typeof peerId === 'string') pass("イベント 'peer-left' ({peerId})", `peerId='${peerId}'`);
+      else fail("イベント 'peer-left' ({peerId})", `peerIdが文字列でない: ${typeof peerId}`);
+    });
+
+    // 4. join()
+    try {
+      await cm.join();
+      pass('await join() が解決する', '入室・シグナリング接続完了');
+    } catch (e) {
+      fail('await join() が解決する', String(e));
+    }
+
+    // 5. getMixedAudioTrack()：録画用の音声トラックが得られるか
+    let firstMixTrack = null;
+    function checkMix(label) {
+      try {
+        const track = cm.getMixedAudioTrack();
+        const ok = track && track.kind === 'audio' && track.readyState === 'live';
+        if (!ok) { fail('getMixedAudioTrack() が生きた音声トラックを返す', `kind=${track?.kind} state=${track?.readyState}`); return; }
+        if (!firstMixTrack) firstMixTrack = track;
+        pass('getMixedAudioTrack() が生きた音声トラックを返す', `${label}: kind=audio / live`);
+        // 契約の肝：人数が変わっても“最初に渡したトラック”が生き続けること
+        if (firstMixTrack) {
+          if (firstMixTrack.readyState === 'live') {
+            pass('人数増減後も最初のmixトラックが生存（録画が途切れない）', `${label}: readyState=live`);
+          } else {
+            fail('人数増減後も最初のmixトラックが生存（録画が途切れない）', `${label}: readyState=${firstMixTrack.readyState}`);
+          }
+        }
+      } catch (e) {
+        fail('getMixedAudioTrack() が生きた音声トラックを返す', String(e));
+      }
+    }
+    checkMix('入室直後');
+
+    // 6. toggleMic / toggleCam が実際にトラックへ効くか
+    //    （契約で渡された local-stream だけを見て判定＝BのUIと同じ情報源）
+    if (localStream) {
+      const a = localStream.getAudioTracks()[0];
+      const v = localStream.getVideoTracks()[0];
+      cm.toggleMic(false);
+      const micOff = a && a.enabled === false;
+      cm.toggleMic(true);
+      const micOn = a && a.enabled === true;
+      if (micOff && micOn) pass('toggleMic(on) が音声トラックのenabledを切替', 'false→true 両方反映');
+      else fail('toggleMic(on) が音声トラックのenabledを切替', `off時=${a?.enabled} / on時復帰=${micOn}`);
+
+      cm.toggleCam(false);
+      const camOff = v && v.enabled === false;
+      cm.toggleCam(true);
+      const camOn = v && v.enabled === true;
+      if (camOff && camOn) pass('toggleCam(on) が映像トラックのenabledを切替', 'false→true 両方反映');
+      else fail('toggleCam(on) が映像トラックのenabledを切替', `off時=${v?.enabled} / on時復帰=${camOn}`);
+    } else {
+      fail('toggleMic/toggleCam の効果確認', 'local-streamが取れていないため未実施');
+    }
+
+    window.addEventListener('beforeunload', () => cm.leave());
+  </script>
+</body>
+</html>

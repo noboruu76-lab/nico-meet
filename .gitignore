@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# 録画・議事録の生成物（担当B領域・大容量）
+minutes/output/
+*.webm
+*.mp4
+
+# TURN証明書（秘密鍵は絶対にコミットしない）
+server/turn/*.pem
+
+# ローカル環境
+.env

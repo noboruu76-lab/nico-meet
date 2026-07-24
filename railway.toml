@@ -1,0 +1,19 @@
+# NICO Meet signaling — Railway デプロイ設定（config as code）
+# 注意: ビルドコンテキストがリポジトリ全体（server/ と web/ の両方が要る）ため、
+# このファイルはリポジトリ直下に置く。Railwayサービスの Root Directory は既定（"/"）のまま。
+# デプロイは main へ push で自動（`railway up` は使わない）。
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "server/Dockerfile"
+
+[deploy]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+# --- 必要な環境変数（Railwayのダッシュボードで設定）---
+# PORT        : Railwayが自動注入（設定不要）
+# STUN_URL    : 省略可（既定 stun:stun.l.google.com:19302）
+# TURN_HOST   : coturnの公開ホスト名/IP（例 turn.example.com）。未設定ならSTUNのみ
+# TURN_SECRET : coturnの static-auth-secret と同じ値
+# TURN_TTL    : 時限クレデンシャルの有効秒数（省略可、既定3600）

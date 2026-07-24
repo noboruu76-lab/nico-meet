@@ -1,0 +1,8 @@
+# デプロイイメージに入れない
+minutes/
+**/__pycache__/
+*.pyc
+.git/
+.gitignore
+README*.md
+docs/

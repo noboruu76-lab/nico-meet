@@ -1,0 +1,23 @@
+# NICO Meet — coturn 起動用（Linux VPS で実行）
+#
+# TURNはリレー用UDPポート範囲と実IPの扱いのため host ネットワークで動かすのが確実。
+# （Docker Desktop/Windows/Mac の host ネットワークは制約があるため、これはLinux VPS想定）
+#
+# 使い方:
+#   1) turnserver.conf の YOUR_* を書き換える
+#   2) docker compose up -d
+#   3) VPSのファイアウォールで開放: 3478/udp, 3478/tcp, 49160-49200/udp
+#      （TLSを使うなら 5349/tcp も）
+
+services:
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: nico-coturn
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      # TLSを使う場合は証明書もマウント:
+      # - ./fullchain.pem:/etc/coturn/fullchain.pem:ro
+      # - ./privkey.pem:/etc/coturn/privkey.pem:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]

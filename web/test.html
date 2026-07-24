@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>NICO Meet — connection test</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+    h1 { font-size: 16px; }
+    #grid { display: flex; flex-wrap: wrap; gap: 8px; }
+    video { width: 320px; height: 240px; background: #000; border-radius: 8px; }
+    .tile { text-align: center; }
+    #log { white-space: pre-wrap; font-size: 12px; color: #9c9; margin-top: 16px; }
+    #bar { margin: 12px 0; }
+    button { background: #333; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+    button.off { background: #722; }
+    #meterWrap { display: inline-block; width: 200px; height: 12px; background: #222; border-radius: 6px; vertical-align: middle; overflow: hidden; }
+    #meter { height: 100%; width: 0; background: #4c9; transition: width 0.05s; }
+    #peerCount { color: #9cf; }
+  </style>
+</head>
+<body>
+  <h1 id="title">NICO Meet — connection test</h1>
+  <div id="bar">
+    <button id="micBtn">🎤 マイク ON</button>
+    <button id="camBtn">📹 カメラ ON</button>
+    <span id="peerCount">peers: 0</span>
+    &nbsp;|&nbsp; mix音量: <span id="meterWrap"><span id="meter"></span></span>
+    <span id="meterVal">0</span>
+  </div>
+  <div id="grid">
+    <div class="tile">
+      <video id="local" autoplay muted playsinline></video>
+      <div>self</div>
+    </div>
+  </div>
+  <div id="log"></div>
+
+  <script type="module">
+    import { ConnectionManager } from './connection.js';
+    import { getIceServers } from './config.js';
+
+    const params = new URLSearchParams(location.search);
+    const room = params.get('room') || 'r1';
+    const user = params.get('user') || ('u' + Math.floor(Math.random() * 1000));
+
+    const log = (msg) => {
+      const el = document.getElementById('log');
+      el.textContent += msg + '\n';
+    };
+
+    // カメラ/マイクが使えない環境向けの疑似メディアモード（&fakemedia=1）。
+    // connection.js本体はgetUserMediaしか呼ばないので、ここでブラウザ標準APIを差し替えるだけで
+    // WebRTC接続（SDP/ICE/ontrack）の実地検証ができる。本番では使わない。
+    if (params.get('fakemedia') === '1') {
+      navigator.mediaDevices.getUserMedia = async () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 320;
+        canvas.height = 240;
+        const ctx = canvas.getContext('2d');
+        const hue = Math.floor(Math.random() * 360);
+        setInterval(() => {
+          ctx.fillStyle = `hsl(${hue}, 70%, ${30 + 20 * Math.sin(Date.now() / 300)}%)`;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }, 100);
+        const videoTrack = canvas.captureStream(15).getVideoTracks()[0];
+
+        const audioCtx = new AudioContext();
+        const osc = audioCtx.createOscillator();
+        osc.frequency.value = 220 + hue;
+        const dest = audioCtx.createMediaStreamDestination();
+        osc.connect(dest);
+        osc.start();
+        const audioTrack = dest.stream.getAudioTracks()[0];
+
+        return new MediaStream([videoTrack, audioTrack]);
+      };
+      log('fakemedia mode: getUserMedia patched');
+    }
+
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const signalingUrl = `${wsProto}://${location.host}/ws`;
+
+    document.getElementById('title').textContent = `NICO Meet test — room=${room} user=${user}`;
+    document.title = `NICO Meet test - ${user}@${room}`;
+
+    // サーバーからTURN込みのICE設定を取得（未設定ならSTUNのみにフォールバック）
+    const iceServers = await getIceServers(location.origin);
+    log('iceServers: ' + iceServers.map((s) => JSON.stringify(s.urls)).join(', '));
+
+    const cm = new ConnectionManager({ room, user, signalingUrl, iceServers });
+    window.cm = cm; // デバッグ用（内部状態を検証で覗く）
+    let meterCtx = null;
+    // 自動再生ポリシー対策: 最初のクリックで音声コンテキストを復帰
+    document.addEventListener('click', () => {
+      if (cm._audioCtx?.state === 'suspended') cm._audioCtx.resume();
+      if (meterCtx?.state === 'suspended') meterCtx.resume();
+    });
+
+    cm.on('local-stream', (stream) => {
+      document.getElementById('local').srcObject = stream;
+      log('local-stream ok');
+    });
+
+    const updatePeerCount = () => {
+      document.getElementById('peerCount').textContent = 'peers: ' + cm.peers.size;
+    };
+
+    cm.on('peer-joined', ({ peerId, stream }) => {
+      let tile = document.getElementById('tile-' + peerId);
+      if (!tile) {
+        tile = document.createElement('div');
+        tile.className = 'tile';
+        tile.id = 'tile-' + peerId;
+        const v = document.createElement('video');
+        v.id = 'video-' + peerId;
+        v.autoplay = true;
+        v.playsInline = true;
+        const label = document.createElement('div');
+        label.textContent = peerId;
+        tile.appendChild(v);
+        tile.appendChild(label);
+        document.getElementById('grid').appendChild(tile);
+      }
+      document.getElementById('video-' + peerId).srcObject = stream;
+      log('peer-joined ' + peerId);
+      updatePeerCount();
+    });
+
+    cm.on('peer-left', ({ peerId }) => {
+      const tile = document.getElementById('tile-' + peerId);
+      if (tile) tile.remove();
+      log('peer-left ' + peerId);
+      updatePeerCount();
+    });
+
+    cm.on('mode-changed', ({ mode }) => log('mode-changed ' + mode));
+
+    // --- マイク/カメラ トグル（toggleMic/toggleCam の結線確認） ---
+    let micOn = true;
+    let camOn = true;
+    const micBtn = document.getElementById('micBtn');
+    const camBtn = document.getElementById('camBtn');
+    micBtn.onclick = () => {
+      micOn = !micOn;
+      cm.toggleMic(micOn);
+      micBtn.textContent = micOn ? '🎤 マイク ON' : '🎤 マイク OFF';
+      micBtn.classList.toggle('off', !micOn);
+      log('toggleMic ' + micOn);
+    };
+    camBtn.onclick = () => {
+      camOn = !camOn;
+      cm.toggleCam(camOn);
+      camBtn.textContent = camOn ? '📹 カメラ ON' : '📹 カメラ OFF';
+      camBtn.classList.toggle('off', !camOn);
+      log('toggleCam ' + camOn);
+    };
+
+    // --- getMixedAudioTrack の音量メーター（全員の声が1本に入っているか可視化） ---
+    const startMeter = () => {
+      const track = cm.getMixedAudioTrack();
+      const ac = new AudioContext();
+      meterCtx = ac;
+      const src = ac.createMediaStreamSource(new MediaStream([track]));
+      const analyser = ac.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      const buf = new Uint8Array(analyser.frequencyBinCount);
+      const meter = document.getElementById('meter');
+      const meterVal = document.getElementById('meterVal');
+      const tick = () => {
+        analyser.getByteTimeDomainData(buf);
+        let peak = 0;
+        for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+        const pct = Math.min(100, Math.round((peak / 128) * 100 * 2));
+        meter.style.width = pct + '%';
+        meterVal.textContent = pct;
+        requestAnimationFrame(tick);
+      };
+      tick();
+    };
+
+    cm.join().then(() => startMeter()).catch((e) => log('join failed: ' + e));
+
+    window.addEventListener('beforeunload', () => cm.leave());
+  </script>
+</body>
+</html>
