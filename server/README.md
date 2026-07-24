@@ -20,7 +20,11 @@ uvicorn signaling:app --reload --port 8000
 |---|---|---|
 | `/ws?room=&user=` | WebSocket | シグナリング中継（契約①） |
 | `/ice-config?user=` | GET | クライアントに渡すICEサーバー一覧（STUN＋時限TURN） |
+| `/health` | GET | 死活監視。`{"status","rooms","clients","turn_configured"}` |
 | `/` 以下 | 静的 | `web/` を配信 |
+
+`/health` はRailwayのヘルスチェック（`railway.toml` の `healthcheckPath`）にも使用。
+`turn_configured` が `false` ならTURN未設定＝STUNのみで動作中。
 
 ## 環境変数
 

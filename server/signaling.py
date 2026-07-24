@@ -40,6 +40,21 @@ def _turn_credentials(secret: str, ttl: int, user: str = "") -> tuple[str, str]:
     return username, credential
 
 
+@app.get("/health")
+def health():
+    """死活監視・切り分け用。Railwayのヘルスチェックからも叩ける。
+
+    メディアはP2Pで流れるためサーバー負荷にはならないが、
+    「シグナリングが生きているか」「今何人繋がっているか」はここで分かる。
+    """
+    return {
+        "status": "ok",
+        "rooms": len(rooms),
+        "clients": sum(len(peers) for peers in rooms.values()),
+        "turn_configured": bool(TURN_HOST and TURN_SECRET),
+    }
+
+
 @app.get("/ice-config")
 def ice_config(user: str = ""):
     """クライアントが接続前に取得するICEサーバー一覧。

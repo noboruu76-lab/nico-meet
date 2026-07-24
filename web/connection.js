@@ -26,8 +26,30 @@ export class ConnectionManager {
     for (const h of this._handlers[event] || []) h(payload);
   }
 
+  // カメラ/マイクが無い・拒否された環境でも入室できるよう段階的に降格する。
+  // 映像音声 → 音声のみ → 映像のみ → 視聴専用（空ストリーム）。
+  // 得られたstreamのトラック構成はUI側で判定できる（stream.getVideoTracks().length など）。
+  async _acquireLocalStream() {
+    const attempts = [
+      { constraints: { video: true, audio: true }, label: '映像+音声' },
+      { constraints: { video: false, audio: true }, label: '音声のみ' },
+      { constraints: { video: true, audio: false }, label: '映像のみ' },
+    ];
+    for (const { constraints, label } of attempts) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        if (label !== '映像+音声') console.warn(`[NICO Meet] ${label}で入室します（デバイス取得の降格）`);
+        return stream;
+      } catch (e) {
+        console.warn(`[NICO Meet] getUserMedia(${label})失敗:`, e.name);
+      }
+    }
+    console.warn('[NICO Meet] 送信できるデバイスがないため視聴専用で入室します');
+    return new MediaStream();
+  }
+
   async join() {
-    this.localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    this.localStream = await this._acquireLocalStream();
     this._emit('local-stream', this.localStream);
 
     const url = `${this.signalingUrl}?room=${encodeURIComponent(this.room)}&user=${encodeURIComponent(this.user)}`;
@@ -78,6 +100,15 @@ export class ConnectionManager {
 
     for (const track of this.localStream.getTracks()) {
       pc.addTrack(track, this.localStream);
+    }
+
+    // 送るトラックが無い種別は「受信専用」の枠を明示的に作る。
+    // これが無いとSDPにその種別のm-lineが立たず、相手の映像/音声を受け取れない。
+    if (this.localStream.getAudioTracks().length === 0) {
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+    }
+    if (this.localStream.getVideoTracks().length === 0) {
+      pc.addTransceiver('video', { direction: 'recvonly' });
     }
 
     pc.onicecandidate = (ev) => {
