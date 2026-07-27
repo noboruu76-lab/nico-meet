@@ -4,9 +4,9 @@
 // 時限クレデンシャルを都度発行する（coturnの use-auth-secret 方式）。
 // サーバー未起動やTURN未設定でもSTUNのみで動くようフォールバックする。
 
-// 即時に使える最小フォールバック（STUNのみ）
+// 即時に使える最小フォールバック（STUN・複数系統で単一障害点を避ける）
 export const iceServers = [
-  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
 ];
 
 // 接続前に呼ぶ。httpBaseUrl 例: 'http://localhost:8000' / 'https://xxx.up.railway.app'

@@ -13,9 +13,26 @@ export class ConnectionManager {
     this.peers = new Map(); // peerId -> { pc, stream }
     this._handlers = {};
 
+    // 実デバイスの有無（UIの「音声なし/映像なし」表示用。無音プレースホルダとは区別する）
+    this.hasLocalVideo = false;
+    this.hasLocalAudio = false;
+
+    // 音声mix（録画用）
     this._audioCtx = null;
     this._audioDest = null;
     this._audioSources = new Map(); // streamId -> MediaStreamAudioSourceNode
+    this._sinkAudioEls = new Map(); // peerId -> HTMLAudioElement（Chrome録音対策 #7）
+    this._silentCtx = null;         // 視聴専用の無音トラック用（GC防止に保持 #2）
+
+    // WS自動再接続（#4）
+    this._leaving = false;
+    this._everConnected = false;
+    this._joinedOnce = false;
+    this._reconnectAttempts = 0;
+    this._reconnectTimer = null;
+    this._iceQueue = [];            // { msg, expires }
+    this._onlineHandler = null;
+    this._visibilityHandler = null;
   }
 
   on(event, handler) {
@@ -27,8 +44,7 @@ export class ConnectionManager {
   }
 
   // カメラ/マイクが無い・拒否された環境でも入室できるよう段階的に降格する。
-  // 映像音声 → 音声のみ → 映像のみ → 視聴専用（空ストリーム）。
-  // 得られたstreamのトラック構成はUI側で判定できる（stream.getVideoTracks().length など）。
+  // 映像音声 → 音声のみ → 映像のみ → 視聴専用（無音トラック1本）。
   async _acquireLocalStream() {
     const attempts = [
       { constraints: { video: true, audio: true }, label: '映像+音声' },
@@ -38,43 +54,141 @@ export class ConnectionManager {
     for (const { constraints, label } of attempts) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        this.hasLocalVideo = stream.getVideoTracks().length > 0;
+        this.hasLocalAudio = stream.getAudioTracks().length > 0;
         if (label !== '映像+音声') console.warn(`[NICO Meet] ${label}で入室します（デバイス取得の降格）`);
         return stream;
       } catch (e) {
         console.warn(`[NICO Meet] getUserMedia(${label})失敗:`, e.name);
       }
     }
-    console.warn('[NICO Meet] 送信できるデバイスがないため視聴専用で入室します');
-    return new MediaStream();
+    // 送れるデバイスが無くても、無音トラックを1本送ることで“他の参加者から見える”ようにする（#2）。
+    // 空ストリーム（0本）だと相手側で ontrack が起きず、参加者一覧に出てこないため。
+    console.warn('[NICO Meet] 送信デバイスなし。無音トラックで視聴専用参加します');
+    this.hasLocalVideo = false;
+    this.hasLocalAudio = false;
+    return new MediaStream([this._createSilentAudioTrack()]);
+  }
+
+  _createSilentAudioTrack() {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const dst = ctx.createMediaStreamDestination();
+    osc.connect(dst);
+    osc.start();
+    const track = dst.stream.getAudioTracks()[0];
+    track.enabled = false; // 無音（送信はするが音は出さない）
+    this._silentCtx = ctx;
+    return track;
   }
 
   async join() {
     this.localStream = await this._acquireLocalStream();
     this._emit('local-stream', this.localStream);
-
-    const url = `${this.signalingUrl}?room=${encodeURIComponent(this.room)}&user=${encodeURIComponent(this.user)}`;
-    this.ws = new WebSocket(url);
-
-    await new Promise((resolve, reject) => {
-      this.ws.addEventListener('open', () => resolve(), { once: true });
-      this.ws.addEventListener('error', (e) => reject(e), { once: true });
-    });
-
-    this.ws.addEventListener('message', (ev) => this._onMessage(JSON.parse(ev.data)));
-    this.ws.addEventListener('close', () => {
-      for (const peerId of [...this.peers.keys()]) this._removePeer(peerId);
-    });
-
+    await this._connectWs();
+    this._installResumeHooks();
     this._emit('mode-changed', { mode: 'mesh' });
+  }
+
+  // WS接続。初回・再接続の両方でこれを使う。
+  _connectWs() {
+    const url = `${this.signalingUrl}?room=${encodeURIComponent(this.room)}&user=${encodeURIComponent(this.user)}`;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const ws = new WebSocket(url);
+      this.ws = ws;
+
+      ws.addEventListener('open', () => {
+        this._everConnected = true;
+        this._reconnectAttempts = 0;
+        this._flushIceQueue();
+        settled = true;
+        resolve();
+      }, { once: true });
+
+      ws.addEventListener('message', (ev) => this._onMessage(JSON.parse(ev.data)));
+
+      ws.addEventListener('close', () => {
+        // 意図的なleaveや初回接続失敗では再接続しない。
+        // それ以外は既存P2Pを畳まず再接続する（WSは合図専用。確立済みメディアはWSに依存しない）。
+        if (this._leaving || !this._everConnected) return;
+        this._scheduleReconnect();
+      });
+
+      ws.addEventListener('error', (e) => {
+        if (!settled) { settled = true; reject(e); }
+        // 接続済みなら close 側で再接続がかかる
+      });
+    });
+  }
+
+  _scheduleReconnect() {
+    if (this._leaving || this._reconnectTimer) return;
+    if (this._reconnectAttempts >= 12) {
+      console.error('[NICO Meet] 再接続を上限(12回)まで試みました。諦めます');
+      return;
+    }
+    const attempt = ++this._reconnectAttempts;
+    const base = Math.min(30000, 500 * 2 ** attempt);
+    const delay = base / 2 + Math.random() * (base / 2); // 指数バックオフ＋ジッター
+    console.warn(`[NICO Meet] WS切断。${Math.round(delay)}ms後に再接続（${attempt}/12）`);
+    this._reconnectTimer = setTimeout(async () => {
+      this._reconnectTimer = null;
+      try {
+        await this._connectWs();
+      } catch (e) {
+        this._scheduleReconnect();
+      }
+    }, delay);
+  }
+
+  // iOSは凍結中に setTimeout が止まるため、画面復帰・オンライン復帰で即再接続する（#4-5）。
+  resumeIfDropped() {
+    if (this._leaving || !this._everConnected) return;
+    const st = this.ws?.readyState;
+    const dead = !this.ws || st === WebSocket.CLOSED || st === WebSocket.CLOSING;
+    if (dead && !this._reconnectTimer) {
+      this._reconnectAttempts = 0;
+      this._scheduleReconnect();
+    }
+  }
+
+  _installResumeHooks() {
+    this._onlineHandler = () => this.resumeIfDropped();
+    this._visibilityHandler = () => { if (document.visibilityState === 'visible') this.resumeIfDropped(); };
+    window.addEventListener('online', this._onlineHandler);
+    document.addEventListener('visibilitychange', this._visibilityHandler);
+  }
+
+  _removeResumeHooks() {
+    if (this._onlineHandler) window.removeEventListener('online', this._onlineHandler);
+    if (this._visibilityHandler) document.removeEventListener('visibilitychange', this._visibilityHandler);
+    this._onlineHandler = this._visibilityHandler = null;
   }
 
   async _onMessage(msg) {
     switch (msg.type) {
-      case 'peers':
+      case 'peers': {
+        const current = new Set(msg.peers);
+        // 再接続時：断中に抜けた相手だけ落とす（幽霊タイル対策）。初回は何も落とさない。
+        // ただしP2Pがまだ生きている相手は残す。サーバー再起動で部屋の記憶が消えると
+        // peersリストが空になるが、それは「相手が抜けた」ではなく「サーバーが忘れた」だけ。
+        // 真実の情報源はP2Pの生死（failed/closedなら本当に切れている）。
+        if (this._joinedOnce) {
+          for (const [id, entry] of this.peers) {
+            const st = entry.pc.connectionState;
+            if (!current.has(id) && (st === 'failed' || st === 'closed')) {
+              this._removePeer(id);
+            }
+          }
+        }
+        this._joinedOnce = true;
+        // 未接続の相手にだけ offer（_createPeer が既存はスキップ）
         for (const peerId of msg.peers) await this._createPeer(peerId, true);
         break;
+      }
       case 'join':
-        // 新規参加者からofferが来るのでここでは何もしない（契約①のグレア回避ルール）
+        // 新規参加者から offer が来るのでここでは待つ（契約①のグレア回避ルール）
         break;
       case 'offer':
         await this._handleOffer(msg);
@@ -92,7 +206,26 @@ export class ConnectionManager {
   }
 
   _send(msg) {
-    this.ws.send(JSON.stringify(msg));
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+      return;
+    }
+    // WS断中：ice だけ貯める（TTL10秒・上限200）。
+    // offer/answer は遅延到着で相手の状態機械と食い違うため貯めない。
+    if (msg.type === 'ice' && this._iceQueue.length < 200) {
+      this._iceQueue.push({ msg, expires: Date.now() + 10000 });
+    }
+  }
+
+  _flushIceQueue() {
+    const now = Date.now();
+    const q = this._iceQueue;
+    this._iceQueue = [];
+    for (const { msg, expires } of q) {
+      if (expires > now && this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(msg));
+      }
+    }
   }
 
   _createPC(peerId) {
@@ -122,6 +255,7 @@ export class ConnectionManager {
       if (!entry) return;
       const alreadyJoined = entry.stream?.id === ev.streams[0]?.id;
       entry.stream = ev.streams[0];
+      this._attachSinkAudio(peerId, entry.stream); // Chrome録音対策（#7）
       this._rebuildMix();
       if (alreadyJoined) return; // 同じstreamの別トラック（音声/映像）到着は既知peerの更新のみ
       this._emit('peer-joined', { peerId, stream: entry.stream });
@@ -167,20 +301,56 @@ export class ConnectionManager {
     }
   }
 
+  // 相手の音声を <audio muted> にも流す。Chromeは相手trackを
+  // MediaStreamAudioSourceNode に繋いでも、メディア要素に載っていないと無音になるため
+  // （録音mixに相手の声が入らない既知の挙動）。実際の音はUIの<video>が出す＝muted。
+  _attachSinkAudio(peerId, stream) {
+    if (!stream || stream.getAudioTracks().length === 0) return;
+    let el = this._sinkAudioEls.get(peerId);
+    if (!el) {
+      el = new Audio();
+      el.autoplay = true;
+      el.muted = true;
+      this._sinkAudioEls.set(peerId, el);
+    }
+    el.srcObject = stream;
+    const p = el.play?.();
+    if (p) p.catch(() => {});
+  }
+
+  _detachSinkAudio(peerId) {
+    const el = this._sinkAudioEls.get(peerId);
+    if (el) {
+      el.srcObject = null;
+      this._sinkAudioEls.delete(peerId);
+    }
+  }
+
   _removePeer(peerId) {
     const entry = this.peers.get(peerId);
     if (!entry) return;
     entry.pc.close();
     this.peers.delete(peerId);
+    this._detachSinkAudio(peerId);
     this._emit('peer-left', { peerId });
     this._rebuildMix();
   }
 
   leave() {
+    this._leaving = true;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+    this._removeResumeHooks();
     if (this.ws) this.ws.close();
     for (const peerId of [...this.peers.keys()]) this._removePeer(peerId);
     if (this.localStream) {
       this.localStream.getTracks().forEach((t) => t.stop());
+    }
+    if (this._silentCtx) {
+      this._silentCtx.close().catch(() => {});
+      this._silentCtx = null;
     }
   }
 

@@ -23,9 +23,16 @@ rooms: Dict[str, Dict[str, WebSocket]] = {}
 # `to` 宛に中継してよいメッセージ種別（契約①）。これ以外は捨てる。
 RELAYABLE_TYPES = {"offer", "answer", "ice"}
 
-# --- TURN（NAT越え）設定。環境変数で注入。未設定ならSTUNのみで動く ---
-STUN_URL = os.environ.get("STUN_URL", "stun:stun.l.google.com:19302")
+# --- STUN/TURN（NAT越え）設定。環境変数で注入。未設定ならSTUNのみで動く ---
+# STUN_URLS はカンマ区切りで複数指定できる（1系統が遮断・レート制限されても他で救う）。
+# 後方互換: 旧 STUN_URL 単体も受ける。
+_stun_raw = os.environ.get("STUN_URLS") or os.environ.get(
+    "STUN_URL", "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478"
+)
+STUN_URLS = [u.strip() for u in _stun_raw.split(",") if u.strip()]
+
 TURN_HOST = os.environ.get("TURN_HOST", "")          # 例: turn.example.com（coturnの公開ホスト）
+TURN_TLS_HOST = os.environ.get("TURN_TLS_HOST", "")  # turns:443 用（TLS証明書のあるドメイン）
 TURN_SECRET = os.environ.get("TURN_SECRET", "")      # coturnと共有する static-auth-secret
 TURN_TTL = int(os.environ.get("TURN_TTL", "3600"))   # 時限クレデンシャルの有効秒数
 
@@ -57,6 +64,7 @@ def health():
         "status": "ok",
         "rooms": len(rooms),
         "clients": sum(len(peers) for peers in rooms.values()),
+        "stun_count": len(STUN_URLS),
         "turn_configured": bool(TURN_HOST and TURN_SECRET),
     }
 
@@ -65,17 +73,21 @@ def health():
 def ice_config(user: str = ""):
     """クライアントが接続前に取得するICEサーバー一覧。
 
-    STUNは常に返す。TURN_HOST/TURN_SECRETが設定されていれば時限クレデンシャル付きの
-    TURN(UDP/TCP)も足す。契約②の iceServers に渡す形そのまま。
+    STUNは常に返す（複数系統で単一障害点を避ける）。TURN_HOST/TURN_SECRETが設定されていれば
+    時限クレデンシャル付きの TURN も足す。契約②の iceServers に渡す形そのまま。
     """
-    ice_servers = [{"urls": STUN_URL}]
+    ice_servers = [{"urls": STUN_URLS}]
     if TURN_HOST and TURN_SECRET:
         username, credential = _turn_credentials(TURN_SECRET, TURN_TTL, user)
+        turn_urls = [
+            f"turn:{TURN_HOST}:3478?transport=udp",
+            f"turn:{TURN_HOST}:3478?transport=tcp",
+        ]
+        # UDP全遮断環境の唯一の出口。TLS証明書のあるドメインがある時だけ足す。
+        if TURN_TLS_HOST:
+            turn_urls.append(f"turns:{TURN_TLS_HOST}:443?transport=tcp")
         ice_servers.append({
-            "urls": [
-                f"turn:{TURN_HOST}:3478?transport=udp",
-                f"turn:{TURN_HOST}:3478?transport=tcp",
-            ],
+            "urls": turn_urls,
             "username": username,
             "credential": credential,
         })

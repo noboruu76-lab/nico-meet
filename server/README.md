@@ -45,8 +45,10 @@ uvicorn signaling:app --reload --port 8000
 | 変数 | 既定 | 説明 |
 |---|---|---|
 | `PORT` | 8000 | 待ち受けポート（Railwayは自動注入） |
-| `STUN_URL` | `stun:stun.l.google.com:19302` | STUNサーバー |
+| `STUN_URLS` | Google + Cloudflare | STUNサーバー（カンマ区切りで複数）。単一障害点を避ける |
+| `STUN_URL` | — | 旧・単体指定（後方互換。`STUN_URLS`優先） |
 | `TURN_HOST` | （空） | coturnの公開ホスト。未設定ならSTUNのみ |
+| `TURN_TLS_HOST` | （空） | `turns:443` 用のTLSドメイン（UDP全遮断環境の出口） |
 | `TURN_SECRET` | （空） | coturnの `static-auth-secret` と同じ値 |
 | `TURN_TTL` | 3600 | 時限クレデンシャルの有効秒数 |
 
