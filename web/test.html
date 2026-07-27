@@ -179,7 +179,14 @@
       tick();
     };
 
-    cm.join().then(() => startMeter()).catch((e) => log('join failed: ' + e));
+    cm.join().then(() => {
+      startMeter();
+      // ?diag=1 で診断ログ開始。コンソールに5秒ごとにRTT/損失/ビットレート等を出す。
+      if (params.get('diag') === '1') {
+        cm.startDiagnostics({ intervalMs: 5000 });
+        log('診断ログ開始（コンソール参照 / cm.downloadDiagnostics()で保存）');
+      }
+    }).catch((e) => log('join failed: ' + e));
 
     window.addEventListener('beforeunload', () => cm.leave());
   </script>

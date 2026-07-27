@@ -38,6 +38,12 @@ export class ConnectionManager {
     this._iceQueue = [];            // { msg, expires }
     this._onlineHandler = null;
     this._visibilityHandler = null;
+
+    // 診断ログ（既定OFF。startDiagnostics()で開始）
+    this._startedAt = 0;
+    this._diagTimer = null;
+    this._diagLog = [];
+    this._diagPrev = new Map();     // peerId -> 前回スナップショット（差分計算用）
   }
 
   on(event, handler) {
@@ -92,6 +98,7 @@ export class ConnectionManager {
   }
 
   async join() {
+    this._startedAt = Date.now();
     this.localStream = await this._acquireLocalStream();
     this._emit('local-stream', this.localStream);
     await this._connectWs();
@@ -409,6 +416,7 @@ export class ConnectionManager {
 
   leave() {
     this._leaving = true;
+    this.stopDiagnostics();
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
@@ -437,6 +445,113 @@ export class ConnectionManager {
     this._rebuildMix();
     if (this._audioCtx.state === 'suspended') this._audioCtx.resume();
     return this._audioDest.stream.getAudioTracks()[0];
+  }
+
+  // ---- 診断ログ（「後半だけ遅い」の切り分け用。既定OFF・契約②に無影響）----
+  // 定期的に getStats() を採り、RTT/ジッタ/損失/ビットレート/フレーム落ち と
+  // 自前リソース数（peers/音声ソース/sink/キュー/JSヒープ）を記録する。
+  // 経時で「回線が悪化(RTT・損失↑)」なのか「端末が重い(フレーム落ち↑)」なのか
+  // 「自前のリーク(リソース数↑・ヒープ↑)」なのかを区別できる。
+  startDiagnostics({ intervalMs = 5000 } = {}) {
+    this.stopDiagnostics();
+    this._diagPrev = new Map();
+    this._diagTimer = setInterval(() => { this._sampleDiagnostics(); }, intervalMs);
+    console.log(`[NICO diag] 診断ログ開始（${intervalMs}ms間隔）。停止: cm.stopDiagnostics() / 保存: cm.downloadDiagnostics()`);
+  }
+
+  stopDiagnostics() {
+    if (this._diagTimer) { clearInterval(this._diagTimer); this._diagTimer = null; }
+  }
+
+  getDiagnosticsLog() {
+    return this._diagLog;
+  }
+
+  downloadDiagnostics() {
+    const blob = new Blob([JSON.stringify(this._diagLog, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `nico-diag-${this.user}-${Date.now()}.json`;
+    a.click();
+  }
+
+  async _sampleDiagnostics() {
+    const now = Date.now();
+    const sample = {
+      t: new Date(now).toISOString(),
+      経過秒: Math.round((now - this._startedAt) / 1000),
+      自前リソース: {
+        peers: this.peers.size,
+        音声ソース: this._audioSources.size,
+        sink要素: this._sinkAudioEls.size,
+        iceキュー: this._iceQueue.length,
+        ws: this.ws?.readyState,
+        JSヒープMB: performance?.memory
+          ? Math.round(performance.memory.usedJSHeapSize / 1e6)
+          : null,
+      },
+      相手: {},
+    };
+
+    for (const [peerId, entry] of this.peers) {
+      let stats;
+      try { stats = await entry.pc.getStats(); } catch { continue; }
+      const cur = { bytesIn: 0, bytesOut: 0, packetsLost: 0, packetsRecv: 0, framesDecoded: 0, framesDropped: 0, ts: now };
+      let rttMs = null, sendRttMs = null, jitterMs = null, localType = null, remoteType = null;
+
+      stats.forEach((r) => {
+        if (r.type === 'inbound-rtp' && !r.isRemote) {
+          cur.bytesIn += r.bytesReceived || 0;
+          cur.packetsLost += r.packetsLost || 0;
+          cur.packetsRecv += r.packetsReceived || 0;
+          if (r.kind === 'video') {
+            cur.framesDecoded += r.framesDecoded || 0;
+            cur.framesDropped += r.framesDropped || 0;
+          }
+          if (r.jitter != null) jitterMs = Math.round(r.jitter * 1000);
+        } else if (r.type === 'outbound-rtp' && !r.isRemote) {
+          cur.bytesOut += r.bytesSent || 0;
+        } else if (r.type === 'remote-inbound-rtp') {
+          if (r.roundTripTime != null) sendRttMs = Math.round(r.roundTripTime * 1000);
+        } else if (r.type === 'candidate-pair' && (r.nominated || r.selected)) {
+          if (r.currentRoundTripTime != null) rttMs = Math.round(r.currentRoundTripTime * 1000);
+        } else if (r.type === 'local-candidate' && (r.candidateType)) {
+          localType = r.candidateType; // host/srflx/relay
+        } else if (r.type === 'remote-candidate' && (r.candidateType)) {
+          remoteType = r.candidateType;
+        }
+      });
+
+      const prev = this._diagPrev.get(peerId);
+      let inKbps = null, outKbps = null, decodeFps = null, lossPct = null;
+      if (prev) {
+        const dt = (cur.ts - prev.ts) / 1000 || 1;
+        inKbps = Math.round(((cur.bytesIn - prev.bytesIn) * 8) / 1000 / dt);
+        outKbps = Math.round(((cur.bytesOut - prev.bytesOut) * 8) / 1000 / dt);
+        decodeFps = Math.round((cur.framesDecoded - prev.framesDecoded) / dt);
+        const dLost = cur.packetsLost - prev.packetsLost;
+        const dRecv = cur.packetsRecv - prev.packetsRecv;
+        lossPct = dLost + dRecv > 0 ? Math.round((dLost / (dLost + dRecv)) * 1000) / 10 : 0;
+      }
+      this._diagPrev.set(peerId, cur);
+
+      sample.相手[peerId] = {
+        pc: entry.pc.connectionState,
+        ice: entry.pc.iceConnectionState,
+        RTTms: rttMs,
+        送信RTTms: sendRttMs,
+        ジッタms: jitterMs,
+        損失率: lossPct,
+        受信kbps: inKbps,
+        送信kbps: outKbps,
+        復号fps: decodeFps,
+        累積フレーム落ち: cur.framesDropped,
+        経路: localType && remoteType ? `${localType}/${remoteType}` : null,
+      };
+    }
+
+    this._diagLog.push(sample);
+    console.log('[NICO diag]', JSON.stringify(sample));
   }
 
   // 出力先(destination)は最初の1回だけ作り、以後は各人の音声ソースを繋ぎ替えるだけ。
