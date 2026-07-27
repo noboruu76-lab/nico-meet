@@ -10,8 +10,13 @@ export class ConnectionManager {
 
     this.ws = null;
     this.localStream = null;
-    this.peers = new Map(); // peerId -> { pc, stream }
+    this.peers = new Map(); // peerId -> { pc, stream, initiator, recoverTimer, iceRetry }
     this._handlers = {};
+
+    // モバイルは上り帯域が細いので送信解像度・ビットレートを絞る（#パッチ④）
+    this._isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(
+      (typeof navigator !== 'undefined' && navigator.userAgent) || ''
+    );
 
     // 実デバイスの有無（UIの「音声なし/映像なし」表示用。無音プレースホルダとは区別する）
     this.hasLocalVideo = false;
@@ -46,10 +51,14 @@ export class ConnectionManager {
   // カメラ/マイクが無い・拒否された環境でも入室できるよう段階的に降格する。
   // 映像音声 → 音声のみ → 映像のみ → 視聴専用（無音トラック1本）。
   async _acquireLocalStream() {
+    // モバイルは640x360/20fpsに抑える。PC等は制約なし（ブラウザ既定）。
+    const video = this._isMobile
+      ? { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 20 } }
+      : true;
     const attempts = [
-      { constraints: { video: true, audio: true }, label: '映像+音声' },
+      { constraints: { video, audio: true }, label: '映像+音声' },
       { constraints: { video: false, audio: true }, label: '音声のみ' },
-      { constraints: { video: true, audio: false }, label: '映像のみ' },
+      { constraints: { video, audio: false }, label: '映像のみ' },
     ];
     for (const { constraints, label } of attempts) {
       try {
@@ -250,6 +259,41 @@ export class ConnectionManager {
       }
     };
 
+    // モバイルは送信ビットレートを絞る（#パッチ④）。addTrack後にsenderへ反映。
+    if (this._isMobile) this._applyMobileBitrate(pc);
+
+    // ICE復旧（#パッチ③）。基地局切替・一過性断・失敗に対応。
+    // 契約②を変えないため peer-failed は発火せず、復旧不能時は既存の peer-left で畳む。
+    pc.onconnectionstatechange = () => {
+      const entry = this.peers.get(peerId);
+      if (!entry) return;
+      const st = pc.connectionState;
+      if (st === 'disconnected') {
+        // 一過性の断。5秒待って戻らなければ張り直す（即restartは無駄打ち）
+        clearTimeout(entry.recoverTimer);
+        entry.recoverTimer = setTimeout(() => {
+          if (this.peers.get(peerId)?.pc.connectionState === 'disconnected') {
+            this._restartIce(peerId);
+          }
+        }, 5000);
+      } else if (st === 'connected') {
+        clearTimeout(entry.recoverTimer);
+        entry.recoverTimer = null;
+        entry.iceRetry = 0;
+      } else if (st === 'failed') {
+        clearTimeout(entry.recoverTimer);
+        entry.recoverTimer = null;
+        // 無限ループ防止。TURNが無い環境では何度やっても成功しないため回数制限。
+        if ((entry.iceRetry ?? 0) < 3) {
+          entry.iceRetry = (entry.iceRetry ?? 0) + 1;
+          this._restartIce(peerId);
+        } else {
+          console.error(`[NICO Meet] peer ${peerId} はICE復旧に失敗。切断扱いにします（TURN未導入だと対称NATは救えません）`);
+          this._removePeer(peerId); // 既存イベント peer-left でUIに反映
+        }
+      }
+    };
+
     pc.ontrack = (ev) => {
       const entry = this.peers.get(peerId);
       if (!entry) return;
@@ -267,12 +311,38 @@ export class ConnectionManager {
   async _createPeer(peerId, initiator) {
     if (this.peers.has(peerId)) return;
     const pc = this._createPC(peerId);
-    this.peers.set(peerId, { pc, stream: null });
+    this.peers.set(peerId, { pc, stream: null, initiator, recoverTimer: null, iceRetry: 0 });
 
     if (initiator) {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       this._send({ type: 'offer', to: peerId, sdp: pc.localDescription });
+    }
+  }
+
+  // ICE restart（offer側のみ実施しグレアを避ける）。createOffer({iceRestart})で
+  // 新しいufrag/pwdの再ネゴを起こす。相手は通常の_handleOfferで応答する。
+  async _restartIce(peerId) {
+    const entry = this.peers.get(peerId);
+    if (!entry || !entry.initiator) return;
+    try {
+      const offer = await entry.pc.createOffer({ iceRestart: true });
+      await entry.pc.setLocalDescription(offer);
+      this._send({ type: 'offer', to: peerId, sdp: entry.pc.localDescription });
+    } catch (e) {
+      console.error('[NICO Meet] ICE restart失敗', e);
+    }
+  }
+
+  // モバイルの送信ビットレート・劣化方針。addTrack済みのvideo senderに反映。
+  _applyMobileBitrate(pc) {
+    for (const sender of pc.getSenders()) {
+      if (sender.track?.kind !== 'video') continue;
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+      params.encodings[0].maxBitrate = 500_000; // 500kbps
+      params.degradationPreference = 'maintain-framerate'; // 帯域低下時はまず解像度を落とす
+      sender.setParameters(params).catch((e) => console.warn('[NICO Meet] setParameters失敗', e));
     }
   }
 
@@ -329,6 +399,7 @@ export class ConnectionManager {
   _removePeer(peerId) {
     const entry = this.peers.get(peerId);
     if (!entry) return;
+    if (entry.recoverTimer) clearTimeout(entry.recoverTimer); // タイマーのリーク解除
     entry.pc.close();
     this.peers.delete(peerId);
     this._detachSinkAudio(peerId);
