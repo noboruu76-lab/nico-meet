@@ -87,7 +87,13 @@
     const iceServers = await getIceServers(location.origin);
     log('iceServers: ' + iceServers.map((s) => JSON.stringify(s.urls)).join(', '));
 
-    const cm = new ConnectionManager({ room, user, signalingUrl, iceServers });
+    // &vbitrate=<kbps> でPCにも送信ビットレート上限を掛けて試せる（opt-in。既定は無制限）
+    const vbitrate = params.get('vbitrate');
+    const cm = new ConnectionManager({
+      room, user, signalingUrl, iceServers,
+      maxVideoBitrate: vbitrate ? Number(vbitrate) * 1000 : undefined,
+    });
+    if (vbitrate) log('送信ビットレート上限: ' + vbitrate + 'kbps');
     window.cm = cm; // デバッグ用（内部状態を検証で覗く）
     let meterCtx = null;
     // 自動再生ポリシー対策: 最初のクリックで音声コンテキストを復帰

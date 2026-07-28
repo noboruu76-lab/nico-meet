@@ -2,7 +2,7 @@
 // UI/録画側はWebRTC内部を知らず、このAPIだけを使う。
 
 export class ConnectionManager {
-  constructor({ room, user, signalingUrl, iceServers }) {
+  constructor({ room, user, signalingUrl, iceServers, maxVideoBitrate }) {
     this.room = room;
     this.user = user;
     this.signalingUrl = signalingUrl;
@@ -17,6 +17,14 @@ export class ConnectionManager {
     this._isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(
       (typeof navigator !== 'undefined' && navigator.userAgent) || ''
     );
+
+    // 送信ビットレート上限(video)。モバイルは既定500kbps、PCは既定なし(null=無制限)。
+    // meshは人数−1本を同時送信するため、通話が進むと上りが飽和して後半遅延が育つ。
+    // 診断ログで上り飽和が確認できたら setMaxVideoBitrate() でPCにも上限を掛けられる（opt-in）。
+    // 既定はPC=null＝従来どおり無制限（画質を落とさない）。
+    this._maxVideoBitrate = maxVideoBitrate !== undefined
+      ? maxVideoBitrate
+      : (this._isMobile ? 500_000 : null);
 
     // 実デバイスの有無（UIの「音声なし/映像なし」表示用。無音プレースホルダとは区別する）
     this.hasLocalVideo = false;
@@ -266,8 +274,9 @@ export class ConnectionManager {
       }
     };
 
-    // モバイルは送信ビットレートを絞る（#パッチ④）。addTrack後にsenderへ反映。
-    if (this._isMobile) this._applyMobileBitrate(pc);
+    // 送信ビットレート上限を反映（#パッチ④＋PC opt-in）。addTrack後にsenderへ反映。
+    // 上限なし(null)なら何もしない＝ブラウザ既定（PCの従来挙動）。
+    if (this._maxVideoBitrate) this._applyVideoBitrate(pc);
 
     // ICE復旧（#パッチ③）。基地局切替・一過性断・失敗に対応。
     // 契約②を変えないため peer-failed は発火せず、復旧不能時は既存の peer-left で畳む。
@@ -341,16 +350,41 @@ export class ConnectionManager {
     }
   }
 
-  // モバイルの送信ビットレート・劣化方針。addTrack済みのvideo senderに反映。
-  _applyMobileBitrate(pc) {
+  // 送信ビットレート上限・劣化方針を video sender に反映（addTrack済みのpcに対して呼ぶ）。
+  // 上限は this._maxVideoBitrate（モバイル既定500kbps／PC既定null）。
+  _applyVideoBitrate(pc) {
+    const cap = this._maxVideoBitrate;
+    if (!cap) return;
     for (const sender of pc.getSenders()) {
       if (sender.track?.kind !== 'video') continue;
       const params = sender.getParameters();
       if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-      params.encodings[0].maxBitrate = 500_000; // 500kbps
+      params.encodings[0].maxBitrate = cap;
       params.degradationPreference = 'maintain-framerate'; // 帯域低下時はまず解像度を落とす
       sender.setParameters(params).catch((e) => console.warn('[NICO Meet] setParameters失敗', e));
     }
+  }
+
+  // 送信ビットレート上限をあとから変える（診断ログで上り飽和を確認した後にPCへ掛ける等）。
+  // bps に数値で上限、null/0 で上限解除。既存の全peerに即反映する（再入室不要）。
+  // 契約②に無影響（追加メソッド。既存の名前は不変）。
+  setMaxVideoBitrate(bps) {
+    this._maxVideoBitrate = bps || null;
+    for (const { pc } of this.peers.values()) {
+      for (const sender of pc.getSenders()) {
+        if (sender.track?.kind !== 'video') continue;
+        const params = sender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+        if (this._maxVideoBitrate) {
+          params.encodings[0].maxBitrate = this._maxVideoBitrate;
+          params.degradationPreference = 'maintain-framerate';
+        } else {
+          delete params.encodings[0].maxBitrate; // 上限解除＝ブラウザ既定に戻す
+        }
+        sender.setParameters(params).catch((e) => console.warn('[NICO Meet] setParameters失敗', e));
+      }
+    }
+    console.log(`[NICO Meet] 送信ビットレート上限: ${this._maxVideoBitrate ? Math.round(this._maxVideoBitrate / 1000) + 'kbps' : '無制限'}`);
   }
 
   async _handleOffer(msg) {
@@ -486,6 +520,7 @@ export class ConnectionManager {
         sink要素: this._sinkAudioEls.size,
         iceキュー: this._iceQueue.length,
         ws: this.ws?.readyState,
+        送信上限kbps: this._maxVideoBitrate ? Math.round(this._maxVideoBitrate / 1000) : null,
         JSヒープMB: performance?.memory
           ? Math.round(performance.memory.usedJSHeapSize / 1e6)
           : null,
